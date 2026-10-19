@@ -92,7 +92,8 @@ def filesystems():
             if total < 1 << 30:
                 continue
             out.append({"mount": mnt, "total": total, "used": total - s.f_bfree * s.f_frsize,
-                        "free": s.f_bavail * s.f_frsize})
+                        "free": s.f_bavail * s.f_frsize,
+                        "inodes_total": s.f_files, "inodes_used": s.f_files - s.f_ffree})
     return out
 
 def gpus():
@@ -236,10 +237,17 @@ def render(results, skipped):
         lines.append("  IO   disk r %-9s w %-9s  net rx %-9s tx %s" % (
             hb(r["disk_io"]["read"], True), hb(r["disk_io"]["write"], True),
             hb(r["net_io"]["rx"], True), hb(r["net_io"]["tx"], True)))
-        for fs in r["fs"]:
+        fss = list(r["fs"])
+        if len(fss) > 1:
+            fss.append({"mount": "total", **{k: sum(fs.get(k, 0) for fs in fss)
+                                             for k in ("total", "used", "free", "inodes_total", "inodes_used")}})
+        for fs in fss:
             p = 100.0 * fs["used"] / fs["total"]
-            lines.append("  HDD  %s %s  %-24s %s free of %s" % (bar(p), c("%5.1f%%" % p, p),
-                                                                fs["mount"][:24], hb(fs["free"]), hb(fs["total"])))
+            # btrfs, vfat, ... report no inode counts (f_files == 0); older probes don't send them at all
+            ip = 100.0 * fs["inodes_used"] / fs["inodes_total"] if fs.get("inodes_total") else None
+            inodes = "  inodes %s" % c("%5.1f%%" % ip, ip) if ip is not None else ""
+            lines.append("  HDD  %s %s  %-24s %-6s free of %-6s%s" % (
+                bar(p), c("%5.1f%%" % p, p), fs["mount"][:24], hb(fs["free"]), hb(fs["total"]), inodes))
         lines.append("")
     if skipped:
         lines.append("not probed: " + ", ".join(skipped))
