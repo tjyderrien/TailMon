@@ -6,7 +6,7 @@ piping a small stdlib-only Python script to `python3 -` (nothing is installed re
 the local machine is probed directly.
 
     tailmon.py                    one snapshot of every online Linux node
-    tailmon.py -w 10              refresh every 10 s
+    tailmon.py -w 1               live view, refreshed every second (one persistent SSH stream per host)
     tailmon.py -w 60 --log m.jsonl   keep a history (one JSON object per host per sample)
     tailmon.py --json             machine-readable snapshot
     tailmon.py --hosts biatri-1,kastanienallee
@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 CONFIG_PATH = os.path.expanduser("~/.config/tailmon.json")
@@ -36,6 +37,7 @@ DEFAULT_CONFIG = {
 PROBE = r'''
 import json, os, socket, subprocess, sys, time
 SAMPLE = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+COUNT = int(sys.argv[2]) if len(sys.argv) > 2 else 1  # 0 = stream forever, one JSON line per SAMPLE seconds
 LOCAL_FS = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "jfs", "reiserfs", "vfat", "exfat", "ntfs", "fuseblk"}
 
 def cpu_times():
@@ -111,18 +113,32 @@ def gpus():
                     "mem_used": (num(p[3]) or 0) * 2**20, "mem_total": (num(p[4]) or 0) * 2**20, "temp": num(p[5])})
     return out
 
-t0, (c0, i0), (dr0, dw0), (nr0, nt0) = time.time(), cpu_times(), disks_io(), net_io()
-time.sleep(SAMPLE)
-t1, (c1, i1), (dr1, dw1), (nr1, nt1) = time.time(), cpu_times(), disks_io(), net_io()
-dt = t1 - t0
-print(json.dumps({
-    "hostname": socket.gethostname(), "time": t1, "ncpu": os.cpu_count(), "load": os.getloadavg(),
-    "cpu": 100.0 * (1 - (i1 - i0) / max(c1 - c0, 1)),
-    "mem": meminfo(),
-    "disk_io": {"read": (dr1 - dr0) / dt, "write": (dw1 - dw0) / dt},
-    "net_io": {"rx": (nr1 - nr0) / dt, "tx": (nt1 - nt0) / dt},
-    "fs": filesystems(), "gpus": gpus(),
-}))
+def counters():
+    return time.time(), cpu_times(), disks_io(), net_io()
+
+def report(prev, cur):
+    t0, (c0, i0), (dr0, dw0), (nr0, nt0) = prev
+    t1, (c1, i1), (dr1, dw1), (nr1, nt1) = cur
+    dt = t1 - t0
+    return json.dumps({
+        "hostname": socket.gethostname(), "time": t1, "ncpu": os.cpu_count(), "load": os.getloadavg(),
+        "cpu": 100.0 * (1 - (i1 - i0) / max(c1 - c0, 1)),
+        "mem": meminfo(),
+        "disk_io": {"read": (dr1 - dr0) / dt, "write": (dw1 - dw0) / dt},
+        "net_io": {"rx": (nr1 - nr0) / dt, "tx": (nt1 - nt0) / dt},
+        "fs": filesystems(), "gpus": gpus(),
+    })
+
+prev, n = counters(), 0
+deadline = prev[0]
+while True:
+    deadline += SAMPLE
+    time.sleep(max(0.0, deadline - time.time()))
+    cur = counters()
+    print(report(prev, cur), flush=True)
+    prev, n = cur, n + 1
+    if COUNT and n >= COUNT:
+        break
 '''
 
 
@@ -148,14 +164,20 @@ def discover():
     return node(st["Self"]), [node(p) for p in (st.get("Peer") or {}).values()]
 
 
+def probe_cmd(node, cfg, is_self, sample, count):
+    probe_args = ["-", str(sample), str(count)]
+    if is_self:
+        return [sys.executable] + probe_args
+    user = cfg["users"].get(node["name"], cfg["default_user"])
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new",
+           "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]
+    if cfg.get("identity"):
+        ssh += ["-i", os.path.expanduser(cfg["identity"])]
+    return ssh + ["%s@%s" % (user, node["dns"] or node["ip"]), "python3"] + probe_args
+
+
 def probe(node, cfg, is_self):
-    args = [sys.executable, "-", str(cfg["sample_seconds"])]
-    if not is_self:
-        user = cfg["users"].get(node["name"], cfg["default_user"])
-        ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=accept-new"]
-        if cfg.get("identity"):
-            ssh += ["-i", os.path.expanduser(cfg["identity"])]
-        args = ssh + ["%s@%s" % (user, node["dns"] or node["ip"]), "python3", "-", str(cfg["sample_seconds"])]
+    args = probe_cmd(node, cfg, is_self, cfg["sample_seconds"], 1)
     try:
         r = subprocess.run(args, input=PROBE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            universal_newlines=True, timeout=30 + cfg["sample_seconds"])
@@ -167,7 +189,8 @@ def probe(node, cfg, is_self):
     return json.loads(r.stdout)
 
 
-def collect(cfg, only=None):
+def targets_for(cfg, only=None):
+    """Return ([(node, is_self)], [skipped descriptions])."""
     me, peers = discover()
     targets, skipped = [(me, True)], []
     for p in peers:
@@ -181,10 +204,60 @@ def collect(cfg, only=None):
         targets.append((p, False))
     if only:
         targets = [t for t in targets if t[0]["name"] in only]
+    return targets, skipped
+
+
+def collect(cfg, only=None):
+    targets, skipped = targets_for(cfg, only)
     with cf.ThreadPoolExecutor(max_workers=16) as ex:
         futs = [(n, ex.submit(probe, n, cfg, s)) for n, s in targets]
         results = [dict(f.result(), node=n["name"]) for n, f in futs]
     return results, skipped
+
+
+class Stream:
+    """One long-lived probe per host that prints a sample every `interval` seconds; reconnects if it dies."""
+    RETRY = 10.0
+
+    def __init__(self, node, cfg, is_self, interval):
+        self.node, self.cfg, self.is_self, self.interval = node, cfg, is_self, interval
+        self.proc, self.latest, self.received, self.seq, self.retry_at = None, None, 0.0, 0, 0.0
+
+    def ensure(self):
+        if (self.proc and self.proc.poll() is None) or time.time() < self.retry_at:
+            return
+        self.retry_at = time.time() + self.RETRY
+        self.proc = subprocess.Popen(probe_cmd(self.node, self.cfg, self.is_self, self.interval, 0),
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     universal_newlines=True, bufsize=1)
+        self.proc.stdin.write(PROBE)
+        self.proc.stdin.close()
+        threading.Thread(target=self._read, args=(self.proc,), daemon=True).start()
+
+    def _read(self, proc):
+        for line in proc.stdout:
+            try:
+                self.latest = json.loads(line)
+            except ValueError:
+                continue
+            self.received, self.seq = time.time(), self.seq + 1
+        err = proc.stderr.read().strip().splitlines()
+        code = proc.wait()
+        self.latest = {"error": (err or ["exit %d" % code])[-1][:120]}
+        self.received, self.seq = time.time(), self.seq + 1
+
+    def result(self):
+        if self.latest is None:
+            r = {"pending": "connecting…"}
+        elif "error" not in self.latest and time.time() - self.received > max(3 * self.interval, 15):
+            r = {"error": "no data for %ds" % (time.time() - self.received)}
+        else:
+            r = self.latest
+        return dict(r, node=self.node["name"])
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -217,6 +290,10 @@ def render(results, skipped):
     w = shutil.get_terminal_size((120, 40)).columns
     lines = [time.strftime("tailmon  %Y-%m-%d %H:%M:%S"), ""]
     for r in sorted(results, key=lambda r: r["node"]):
+        if "pending" in r:
+            lines.append("%-16s %s" % (r["node"], r["pending"]))
+            lines.append("")
+            continue
         if "error" in r:
             lines.append("%-16s %s" % (r["node"], c("UNREACHABLE: " + r["error"], 100)))
             lines.append("")
@@ -254,6 +331,41 @@ def render(results, skipped):
     return "\n".join(l if len(l) < w + 20 else l[:w + 20] for l in lines)
 
 
+def draw(results, skipped, live):
+    out = render(results, skipped)
+    if live and COLOR:
+        # home the cursor and overwrite in place (clear to end of each line / screen) to avoid flicker
+        out = "\033[H" + out.replace("\n", "\033[K\n") + "\033[K\033[J"
+    print(out, flush=True)
+
+
+def watch(cfg, only, a):
+    targets, skipped = targets_for(cfg, only)
+    streams = [Stream(n, cfg, s, a.watch) for n, s in targets]
+    logged = {}
+    if not a.quiet and COLOR:
+        print("\033[2J", end="")
+    try:
+        deadline = time.time()
+        while True:
+            for s in streams:
+                s.ensure()
+            results = [s.result() for s in streams]
+            if a.log:
+                with open(os.path.expanduser(a.log), "a") as f:
+                    for s, r in zip(streams, results):
+                        if s.seq != logged.get(s.node["name"], 0):
+                            logged[s.node["name"]] = s.seq
+                            f.write(json.dumps(r) + "\n")
+            if not a.quiet:
+                draw(results, skipped, True)
+            deadline += a.watch
+            time.sleep(max(0.0, deadline - time.time()))
+    finally:
+        for s in streams:
+            s.stop()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-w", "--watch", type=float, metavar="SEC", help="refresh every SEC seconds")
@@ -265,21 +377,17 @@ def main():
     cfg = load_config()
     only = set(a.hosts.split(",")) if a.hosts else None
 
-    while True:
-        results, skipped = collect(cfg, only)
-        if a.log:
-            with open(os.path.expanduser(a.log), "a") as f:
-                for r in results:
-                    f.write(json.dumps(r) + "\n")
-        if a.json:
-            print(json.dumps(results, indent=2))
-            return
-        if not a.quiet:
-            out = render(results, skipped)
-            print(("\033[H\033[2J" if a.watch and COLOR else "") + out, flush=True)
-        if not a.watch:
-            return
-        time.sleep(max(0.0, a.watch - cfg["sample_seconds"]))
+    if a.watch and not a.json:
+        return watch(cfg, only, a)
+    results, skipped = collect(cfg, only)
+    if a.log:
+        with open(os.path.expanduser(a.log), "a") as f:
+            for r in results:
+                f.write(json.dumps(r) + "\n")
+    if a.json:
+        print(json.dumps(results, indent=2))
+    elif not a.quiet:
+        draw(results, skipped, False)
 
 
 if __name__ == "__main__":
