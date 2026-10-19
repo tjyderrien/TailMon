@@ -9,7 +9,7 @@ the local machine is probed directly.
     tailmon.py -w 1               live view, refreshed every second (one persistent SSH stream per host)
     tailmon.py -w 60 --log m.jsonl   keep a history (one JSON object per host per sample)
     tailmon.py --json             machine-readable snapshot
-    tailmon.py --hosts biatri-1,kastanienallee
+    tailmon.py --hosts web-1,db-1
 """
 import argparse
 import concurrent.futures as cf
@@ -23,12 +23,16 @@ import time
 
 CONFIG_PATH = os.path.expanduser("~/.config/tailmon.json")
 DEFAULT_CONFIG = {
-    # SSH user per Tailscale hostname; hosts not listed use "default_user".
-    "users": {"biatri-1": "thibault.derrien", "biatri-2": "thibault.derrien"},
-    "default_user": "thibault",
-    "identity": "~/.ssh/id_rsa_hilase",
+    # SSH user per Tailscale hostname; hosts not listed use "default_user"
+    # (null: whatever ssh picks, i.e. ~/.ssh/config or your local username).
+    "users": {},
+    "default_user": None,
+    # SSH private key passed with -i; null: ssh's usual keys / agent.
+    "identity": None,
     "exclude": [],
     "sample_seconds": 1.0,
+    # In watch mode, how often to re-run `tailscale status` to pick up hosts that came online / went away.
+    "discover_seconds": 30.0,
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -173,7 +177,8 @@ def probe_cmd(node, cfg, is_self, sample, count):
            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]
     if cfg.get("identity"):
         ssh += ["-i", os.path.expanduser(cfg["identity"])]
-    return ssh + ["%s@%s" % (user, node["dns"] or node["ip"]), "python3"] + probe_args
+    host = node["dns"] or node["ip"]
+    return ssh + ["%s@%s" % (user, host) if user else host, "python3"] + probe_args
 
 
 def probe(node, cfg, is_self):
@@ -339,21 +344,40 @@ def draw(results, skipped, live):
     print(out, flush=True)
 
 
-def watch(cfg, only, a):
+def rediscover(streams, logged, cfg, only, interval):
+    """Start streams for newly seen hosts and stop those that went away; return the skipped list."""
     targets, skipped = targets_for(cfg, only)
-    streams = [Stream(n, cfg, s, a.watch) for n, s in targets]
-    logged = {}
+    names = {n["name"] for n, _ in targets}
+    for name in set(streams) - names:
+        streams.pop(name).stop()
+        logged.pop(name, None)
+    for n, is_self in targets:
+        if n["name"] not in streams:
+            streams[n["name"]] = Stream(n, cfg, is_self, interval)
+    return skipped
+
+
+def watch(cfg, only, a):
+    streams, logged = {}, {}
+    skipped = rediscover(streams, logged, cfg, only, a.watch)
+    next_discover = time.time() + cfg["discover_seconds"]
     if not a.quiet and COLOR:
         print("\033[2J", end="")
     try:
         deadline = time.time()
         while True:
-            for s in streams:
+            if time.time() >= next_discover:
+                next_discover = time.time() + cfg["discover_seconds"]
+                try:
+                    skipped = rediscover(streams, logged, cfg, only, a.watch)
+                except (OSError, ValueError, subprocess.CalledProcessError):
+                    pass  # tailscale hiccup: keep the current host list and try again later
+            for s in streams.values():
                 s.ensure()
-            results = [s.result() for s in streams]
+            results = [s.result() for s in streams.values()]
             if a.log:
                 with open(os.path.expanduser(a.log), "a") as f:
-                    for s, r in zip(streams, results):
+                    for s, r in zip(streams.values(), results):
                         if s.seq != logged.get(s.node["name"], 0):
                             logged[s.node["name"]] = s.seq
                             f.write(json.dumps(r) + "\n")
@@ -362,7 +386,7 @@ def watch(cfg, only, a):
             deadline += a.watch
             time.sleep(max(0.0, deadline - time.time()))
     finally:
-        for s in streams:
+        for s in streams.values():
             s.stop()
 
 
