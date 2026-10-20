@@ -75,6 +75,8 @@ Optional, in `~/.config/tailmon.json`. Any key you set overrides the built-in de
 | `sample_seconds`   | Measurement window for rates (CPU %, disk / network throughput) in snapshot mode         |
 | `discover_seconds` | In watch mode, how often to re-run `tailscale status` to find new or departed hosts      |
 
+tailmon runs `ssh <short-name>` with the Tailscale address pinned as `HostName`, so `Host <short-name>` entries in
+`~/.ssh/config` (`User`, `IdentityFile`, …) apply as they would for a plain `ssh <short-name>`.
 SSH connects with `BatchMode=yes` (it never prompts) and `StrictHostKeyChecking=accept-new`.
 
 Nothing is required: with no config file, tailmon connects to each host the way a plain `ssh <host>` would.
@@ -88,6 +90,9 @@ Nothing is required: with no config file, tailmon connects to each host the way 
 | GPU    | `nvidia-smi`: utilization, memory, temperature per GPU                                          |
 | IO     | `/proc/diskstats` (physical disks only) and `/proc/net/dev` (excluding `lo`, docker, veth, bridges, tailscale) |
 | HDD    | `statvfs` on local filesystems ≥ 1 GiB (ext*, xfs, btrfs, zfs, …), with inode usage when the FS reports it, plus a per-host total |
+| TOTAL  | storage summed over all hosts, shown only when at most one Linux host is offline or unreachable (then marked incomplete). Excluded and non-Linux peers don't count |
+| USERS  | `who`: interactive logins; people other than the SSH user are highlighted                        |
+| SLURM  | `sinfo` / `squeue`, when installed (refreshed at most every 10 s): node state and CPU allocation, then the job queue. Hosts reporting the same cluster show it once |
 
 ## License
 

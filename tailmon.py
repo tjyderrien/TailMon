@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
 # Probe: runs on the target machine. Python >= 3.6, standard library only, reads /proc.
 # ---------------------------------------------------------------------------------------------
 PROBE = r'''
-import json, os, socket, subprocess, sys, time
+import json, os, pwd, socket, subprocess, sys, time
 SAMPLE = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
 COUNT = int(sys.argv[2]) if len(sys.argv) > 2 else 1  # 0 = stream forever, one JSON line per SAMPLE seconds
 LOCAL_FS = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "jfs", "reiserfs", "vfat", "exfat", "ntfs", "fuseblk"}
@@ -117,6 +117,57 @@ def gpus():
                     "mem_used": (num(p[3]) or 0) * 2**20, "mem_total": (num(p[4]) or 0) * 2**20, "temp": num(p[5])})
     return out
 
+def run(args):
+    try:
+        r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True,
+                           timeout=10, env=dict(os.environ, LC_ALL="C"))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+def sessions():
+    """Interactive logins from utmp (`who`); non-interactive ssh commands, like this probe, don't appear."""
+    out = []
+    for line in (run(["who"]) or "").splitlines():
+        p = line.split()
+        if len(p) < 2:
+            continue
+        frm = p[-1][1:-1] if p[-1].startswith("(") and p[-1].endswith(")") else ""
+        since = " ".join(p[2:-1] if frm else p[2:])
+        out.append({"user": p[0], "tty": p[1], "from": frm, "since": since})
+    return out
+
+SLURM_EVERY = 10.0  # don't hammer slurmctld at the sample rate
+slurm_cache = [0.0, None]
+
+def slurm():
+    if time.time() - slurm_cache[0] < SLURM_EVERY:
+        return slurm_cache[1]
+    slurm_cache[0] = time.time()
+    nodes_out = run(["sinfo", "-h", "-N", "-o", "%N|%T|%C|%m|%e|%G"])
+    jobs_out = run(["squeue", "-h", "-o", "%i|%u|%T|%j|%M|%D|%C|%N|%r"])
+    if nodes_out is None and jobs_out is None:
+        slurm_cache[1] = None  # no SLURM here
+        return None
+    nodes, seen = [], set()
+    for line in (nodes_out or "").splitlines():
+        p = line.split("|")
+        if len(p) < 6 or p[0] in seen:  # a node in several partitions is listed once per partition
+            continue
+        seen.add(p[0])
+        cpus = (p[2].split("/") + ["0"] * 4)[:4]  # allocated/idle/other/total
+        num = lambda s: int(s) if s.isdigit() else None
+        nodes.append({"name": p[0], "state": p[1], "cpu_alloc": num(cpus[0]), "cpu_total": num(cpus[3]),
+                      "mem_total": (num(p[3]) or 0) * 2**20, "mem_free": (num(p[4]) or 0) * 2**20, "gres": p[5]})
+    jobs = []
+    for line in (jobs_out or "").splitlines():
+        p = line.split("|", 8)
+        if len(p) == 9:
+            jobs.append({"id": p[0], "user": p[1], "state": p[2], "name": p[3], "time": p[4],
+                         "nodes": p[5], "cpus": p[6], "nodelist": p[7], "reason": p[8]})
+    slurm_cache[1] = {"nodes": nodes, "jobs": jobs}
+    return slurm_cache[1]
+
 def counters():
     return time.time(), cpu_times(), disks_io(), net_io()
 
@@ -131,6 +182,7 @@ def report(prev, cur):
         "disk_io": {"read": (dr1 - dr0) / dt, "write": (dw1 - dw0) / dt},
         "net_io": {"rx": (nr1 - nr0) / dt, "tx": (nt1 - nt0) / dt},
         "fs": filesystems(), "gpus": gpus(),
+        "user": pwd.getpwuid(os.getuid()).pw_name, "sessions": sessions(), "slurm": slurm(),
     })
 
 prev, n = counters(), 0
@@ -177,7 +229,10 @@ def probe_cmd(node, cfg, is_self, sample, count):
            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"]
     if cfg.get("identity"):
         ssh += ["-i", os.path.expanduser(cfg["identity"])]
-    host = node["dns"] or node["ip"]
+    # Connect by the short Tailscale name so `Host <name>` entries in ~/.ssh/config (User, IdentityFile, ...)
+    # apply exactly as for a plain `ssh <name>`, but pin the address to the tailnet one.
+    ssh += ["-o", "HostName=%s" % (node["dns"] or node["ip"])]
+    host = node["name"]
     return ssh + ["%s@%s" % (user, host) if user else host, "python3"] + probe_args
 
 
@@ -195,7 +250,7 @@ def probe(node, cfg, is_self):
 
 
 def targets_for(cfg, only=None):
-    """Return ([(node, is_self)], [skipped descriptions])."""
+    """Return ([(node, is_self)], [skipped nodes])."""
     me, peers = discover()
     targets, skipped = [(me, True)], []
     for p in peers:
@@ -204,7 +259,7 @@ def targets_for(cfg, only=None):
         if p["name"] in cfg["exclude"]:
             continue
         if p["os"] != "linux" or not p["online"]:
-            skipped.append("%s (%s)" % (p["name"], p["os"] if p["online"] else "offline"))
+            skipped.append(p)
             continue
         targets.append((p, False))
     if only:
@@ -291,9 +346,96 @@ def bar(pct, width=10):
     return c("█" * filled + "·" * (width - filled), pct)
 
 
+def fs_total(fss, label):
+    return {"mount": label, **{k: sum(fs.get(k, 0) for fs in fss)
+                               for k in ("total", "used", "free", "inodes_total", "inodes_used")}}
+
+
+def hdd_line(fs):
+    p = 100.0 * fs["used"] / fs["total"] if fs["total"] else 0
+    # btrfs, vfat, ... report no inode counts (f_files == 0); older probes don't send them at all
+    ip = 100.0 * fs["inodes_used"] / fs["inodes_total"] if fs.get("inodes_total") else None
+    inodes = "  inodes %s" % c("%5.1f%%" % ip, ip) if ip is not None else ""
+    return "  HDD  %s %s  %-24s %-6s free of %-6s%s" % (
+        bar(p), c("%5.1f%%" % p, p), fs["mount"][:24], hb(fs["free"]), hb(fs["total"]), inodes)
+
+
+def render_total(results, skipped):
+    """Storage summed over every host; drawn only when at most one Linux host is missing (offline / unreachable)."""
+    ok = [r for r in results if "fs" in r]
+    missing = sorted([r["node"] for r in results if "fs" not in r] +
+                     [p["name"] for p in skipped if p["os"] == "linux" and not p["online"]])
+    if len(ok) < 2 or len(missing) > 1:
+        return []
+    note = c("incomplete: %s missing" % missing[0], 75) if missing else "complete"
+    lines = ["TOTAL            %d/%d hosts  %s" % (len(ok), len(ok) + len(missing), note)]
+    lines += [hdd_line(fs_total([fs_total(r["fs"], "") for r in ok], "all hosts"))]
+    return lines + [""]
+
+
+def render_users(r):
+    """One USERS row: interactive logins, other people highlighted (yellow); nothing if nobody is logged in."""
+    by_user = {}
+    for s in r.get("sessions") or []:
+        by_user.setdefault(s["user"], []).append(s)
+    if not by_user:
+        return []
+    me, parts = r.get("user"), []
+    for user in sorted(by_user, key=lambda u: (u == me, u)):
+        ss = by_user[user]
+        if user == me:
+            parts.append("%s (you)%s" % (user, " ×%d" % len(ss) if len(ss) > 1 else ""))
+            continue
+        where = ", ".join(" ".join(x for x in (s["tty"], s["from"], "since " + s["since"]) if x) for s in ss)
+        parts.append(c("%s [%s]" % (user, where), 75))
+    others = sum(1 for u in by_user if u != me)
+    head = c("%d other" % others, 75) + ": " if others else ""
+    return ["  USERS %s%s" % (head, "; ".join(parts))]
+
+
+SLURM_MAX_JOBS = 15
+
+
+def render_slurm(r, shown):
+    """SLURM nodes + queue. Hosts of the same cluster report the same data: draw it once, under the first one."""
+    sl = r.get("slurm")
+    if not sl:
+        return []
+    key = tuple(sorted(n["name"] for n in sl["nodes"])) or ("jobs",) + tuple(j["id"] for j in sl["jobs"])
+    if key in shown:
+        return ["  SLURM same cluster as %s" % shown[key]]
+    shown[key] = r["node"]
+    me, lines = r.get("user"), []
+    for n in sl["nodes"]:
+        cp = 100.0 * n["cpu_alloc"] / n["cpu_total"] if n["cpu_total"] else 0
+        mem = "  mem free %s / %s" % (hb(n["mem_free"]), hb(n["mem_total"])) if n["mem_total"] else ""
+        gres = "  %s" % n["gres"] if n["gres"] not in ("", "(null)") else ""
+        bad = any(s in n["state"] for s in ("down", "drain", "fail"))
+        lines.append("  SLURM %s %s  %-14s %s%s %s/%s cpus alloc%s%s" % (
+            bar(cp), c("%5.1f%%" % cp, cp), n["name"][:14], c(n["state"], 100) if bad else n["state"],
+            " " * max(1, 10 - len(n["state"])), n["cpu_alloc"], n["cpu_total"], mem, gres))
+    jobs = sl["jobs"]
+    running = [j for j in jobs if j["state"] == "RUNNING"]
+    pending = [j for j in jobs if j["state"] == "PENDING"]
+    lines.append("  JOBS  %d running, %d pending%s" % (len(running), len(pending),
+                                                        ", %d other" % (len(jobs) - len(running) - len(pending))
+                                                        if len(jobs) > len(running) + len(pending) else ""))
+    order = {"RUNNING": 0, "PENDING": 1}
+    for j in sorted(jobs, key=lambda j: order.get(j["state"], 2))[:SLURM_MAX_JOBS]:
+        where = j["nodelist"] if j["state"] == "RUNNING" else "(%s)" % j["reason"]
+        user = "%-16s" % j["user"][:16]
+        user = user if j["user"] == me else c(user, 75)
+        lines.append("    %-9s %s %-8s %10s  %4s cpu  %-16s %s" % (
+            j["id"][:9], user, j["state"][:8], j["time"], j["cpus"], where[:16], j["name"][:30]))
+    if len(jobs) > SLURM_MAX_JOBS:
+        lines.append("    … %d more" % (len(jobs) - SLURM_MAX_JOBS))
+    return lines
+
+
 def render(results, skipped):
     w = shutil.get_terminal_size((120, 40)).columns
     lines = [time.strftime("tailmon  %Y-%m-%d %H:%M:%S"), ""]
+    slurm_shown = {}
     for r in sorted(results, key=lambda r: r["node"]):
         if "pending" in r:
             lines.append("%-16s %s" % (r["node"], r["pending"]))
@@ -321,18 +463,15 @@ def render(results, skipped):
             hb(r["net_io"]["rx"], True), hb(r["net_io"]["tx"], True)))
         fss = list(r["fs"])
         if len(fss) > 1:
-            fss.append({"mount": "total", **{k: sum(fs.get(k, 0) for fs in fss)
-                                             for k in ("total", "used", "free", "inodes_total", "inodes_used")}})
-        for fs in fss:
-            p = 100.0 * fs["used"] / fs["total"]
-            # btrfs, vfat, ... report no inode counts (f_files == 0); older probes don't send them at all
-            ip = 100.0 * fs["inodes_used"] / fs["inodes_total"] if fs.get("inodes_total") else None
-            inodes = "  inodes %s" % c("%5.1f%%" % ip, ip) if ip is not None else ""
-            lines.append("  HDD  %s %s  %-24s %-6s free of %-6s%s" % (
-                bar(p), c("%5.1f%%" % p, p), fs["mount"][:24], hb(fs["free"]), hb(fs["total"]), inodes))
+            fss.append(fs_total(fss, "total"))
+        lines += [hdd_line(fs) for fs in fss]
+        lines += render_users(r)
+        lines += render_slurm(r, slurm_shown)
         lines.append("")
+    lines += render_total(results, skipped)
     if skipped:
-        lines.append("not probed: " + ", ".join(skipped))
+        lines.append("not probed: " + ", ".join(
+            "%s (%s)" % (p["name"], p["os"] if p["online"] else "offline") for p in skipped))
     return "\n".join(l if len(l) < w + 20 else l[:w + 20] for l in lines)
 
 
