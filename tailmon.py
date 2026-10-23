@@ -14,6 +14,7 @@ the local machine is probed directly.
 import argparse
 import concurrent.futures as cf
 import json
+import shlex
 import os
 import shutil
 import subprocess
@@ -199,6 +200,73 @@ while True:
 
 
 # ---------------------------------------------------------------------------------------------
+# File tools: a small stdlib-only worker streamed to each host over the existing SSH connection.
+# ---------------------------------------------------------------------------------------------
+FILE_TOOL = r'''
+import fnmatch, io, json, os, re, sys
+
+operation, root, pattern = sys.argv[1:4]
+root = os.path.expanduser(root)
+limit = int(sys.argv[4])
+include_hidden = sys.argv[5] == "1"
+ignore_case = sys.argv[6] == "1"
+fixed = sys.argv[7] == "1"
+
+def wanted(name):
+    return include_hidden or not name.startswith(".")
+
+def emit(value):
+    print(json.dumps(value, ensure_ascii=True), flush=True)
+
+try:
+    if operation == "search":
+        for directory, dirs, files in os.walk(root, topdown=True, followlinks=False):
+            dirs[:] = [d for d in dirs if wanted(d)]
+            for name in files:
+                if not wanted(name) or not fnmatch.fnmatch(name, pattern):
+                    continue
+                path = os.path.join(directory, name)
+                try:
+                    if os.path.isfile(path):
+                        emit({"path": path})
+                        limit -= 1
+                except OSError:
+                    pass
+                if limit <= 0:
+                    raise SystemExit
+    elif operation == "grep":
+        flags = re.IGNORECASE if ignore_case else 0
+        matcher = re.compile(re.escape(pattern) if fixed else pattern, flags)
+        for directory, dirs, files in os.walk(root, topdown=True, followlinks=False):
+            dirs[:] = [d for d in dirs if wanted(d)]
+            for name in files:
+                if not wanted(name):
+                    continue
+                path = os.path.join(directory, name)
+                try:
+                    raw = open(path, "rb")
+                    if b"\x00" in raw.read(8192):
+                        raw.close()
+                        continue
+                    raw.seek(0)
+                    stream = io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+                    try:
+                        for number, line in enumerate(stream, 1):
+                            if matcher.search(line):
+                                emit({"path": path, "line": number, "text": line.rstrip("\n\r")})
+                                limit -= 1
+                                if limit <= 0:
+                                    raise SystemExit
+                    finally:
+                        stream.close()
+                except (OSError, UnicodeError):
+                    pass
+except re.error as exc:
+    emit({"error": "invalid pattern: %s" % exc})
+'''
+
+
+# ---------------------------------------------------------------------------------------------
 # Collector
 # ---------------------------------------------------------------------------------------------
 def load_config():
@@ -273,6 +341,74 @@ def collect(cfg, only=None):
         futs = [(n, ex.submit(probe, n, cfg, s)) for n, s in targets]
         results = [dict(f.result(), node=n["name"]) for n, f in futs]
     return results, skipped
+
+
+def file_tool_cmd(node, cfg, is_self, operation, root, pattern, limit, hidden, ignore_case, fixed):
+    args = ["-", operation, root, pattern, str(limit), "1" if hidden else "0",
+            "1" if ignore_case else "0", "1" if fixed else "0"]
+    if is_self:
+        return [sys.executable] + args
+    user = cfg["users"].get(node["name"], cfg["default_user"])
+    ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+           "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=5",
+           "-o", "ServerAliveCountMax=3"]
+    if cfg.get("identity"):
+        ssh += ["-i", os.path.expanduser(cfg["identity"])]
+    ssh += ["-o", "HostName=%s" % (node["dns"] or node["ip"])]
+    host = "%s@%s" % (user, node["name"]) if user else node["name"]
+    # ssh passes the command through the remote login shell; quote globs and regexes.
+    return ssh + [host] + [shlex.quote(value) for value in ["python3"] + args]
+
+
+def file_tool_on_host(node, cfg, is_self, operation, root, pattern, limit, hidden, ignore_case, fixed):
+    try:
+        result = subprocess.run(
+            file_tool_cmd(node, cfg, is_self, operation, root, pattern, limit, hidden, ignore_case, fixed),
+            input=FILE_TOOL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return [{"node": node["name"], "error": "timeout"}]
+    if result.returncode != 0:
+        err = (result.stderr.strip().splitlines() or ["exit %d" % result.returncode])[-1]
+        return [{"node": node["name"], "error": err[:160]}]
+    rows = []
+    for line in result.stdout.splitlines():
+        try:
+            rows.append(dict(json.loads(line), node=node["name"]))
+        except ValueError:
+            continue
+    return rows
+
+
+def file_tool(cfg, only, operation, root, pattern, limit, hidden, ignore_case=False, fixed=False):
+    targets, skipped = targets_for(cfg, only)
+    with cf.ThreadPoolExecutor(max_workers=16) as ex:
+        futs = [ex.submit(file_tool_on_host, n, cfg, is_self, operation, root, pattern,
+                          limit, hidden, ignore_case, fixed) for n, is_self in targets]
+        rows = [row for future in futs for row in future.result()]
+    # A limit applies to the combined tailnet result, not independently to every host.
+    data = [row for row in rows if "error" not in row][:limit]
+    errors = [row for row in rows if "error" in row]
+    return data, errors, skipped
+
+
+def render_file_results(operation, rows, errors, skipped, as_json):
+    if as_json:
+        print(json.dumps({"results": rows, "errors": errors,
+                          "skipped": [p["name"] for p in skipped]}, indent=2))
+        return
+    if rows:
+        for row in rows:
+            if operation == "grep":
+                print("%s:%s:%s: %s" % (row["node"], row["path"], row["line"], row["text"]))
+            else:
+                print("%s: %s" % (row["node"], row["path"]))
+    else:
+        print("no matches")
+    for row in errors:
+        print("%s: ERROR: %s" % (row["node"], row["error"]), file=sys.stderr)
+    if skipped:
+        print("not searched: " + ", ".join(p["name"] for p in skipped), file=sys.stderr)
 
 
 class Stream:
@@ -529,7 +665,47 @@ def watch(cfg, only, a):
             s.stop()
 
 
+def file_main(argv):
+    ap = argparse.ArgumentParser(description="Search or grep files across the Tailscale network")
+    sub = ap.add_subparsers(dest="operation")
+
+    def common(parser):
+        parser.add_argument("--hosts", help="comma-separated Tailscale hostnames to search")
+        parser.add_argument("--max-results", type=int, default=1000, metavar="N",
+                            help="maximum results across all hosts")
+        parser.add_argument("--hidden", action="store_true", help="include hidden files and directories")
+        parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+
+    search = sub.add_parser("search", help="find files by name")
+    common(search)
+    search.add_argument("path", nargs="?", default=".", help="root directory on each host")
+    search.add_argument("--name", default="*", help="filename glob, e.g. '*.log'")
+
+    grep = sub.add_parser("grep", help="search file contents with a regular expression")
+    common(grep)
+    grep.add_argument("pattern", help="regular expression (or literal with --fixed-strings)")
+    grep.add_argument("path", nargs="?", default=".", help="root directory on each host")
+    grep.add_argument("--fixed-strings", action="store_true", help="treat pattern as literal text")
+    grep.add_argument("-i", "--ignore-case", action="store_true")
+
+    a = ap.parse_args(argv)
+    if not a.operation:
+        ap.error("choose 'search' or 'grep'")
+    if a.max_results < 1:
+        ap.error("--max-results must be at least 1")
+    cfg = load_config()
+    only = set(x for x in a.hosts.split(",") if x) if a.hosts else None
+    pattern = a.name if a.operation == "search" else a.pattern
+    rows, errors, skipped = file_tool(cfg, only, a.operation, a.path, pattern,
+                                       a.max_results, a.hidden,
+                                       getattr(a, "ignore_case", False),
+                                       getattr(a, "fixed_strings", False))
+    render_file_results(a.operation, rows, errors, skipped, a.json)
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("search", "grep"):
+        return file_main(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-w", "--watch", type=float, metavar="SEC", help="refresh every SEC seconds")
     ap.add_argument("--json", action="store_true", help="print a JSON snapshot and exit")
